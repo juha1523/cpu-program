@@ -54,6 +54,7 @@ if (-not (Test-Path $ico)) {
     "/win32manifest:$src\app.manifest" `
     "/win32icon:$ico" `
     /r:System.Windows.Forms.dll /r:System.Drawing.dll /r:System.Core.dll `
-    "$src\AffinityManager.cs"
+    /r:Microsoft.CSharp.dll `
+    "$src\*.cs"
 if ($LASTEXITCODE -ne 0) { throw "Build failed" }
 Write-Host "Built $root\AffinityManager.exe"

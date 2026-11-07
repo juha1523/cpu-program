@@ -1,237 +1,258 @@
 // Affinity Manager - set CPU priority / affinity per program and remember it.
-// Single-file WinForms app, compiles with the csc.exe that ships with Windows (.NET Framework 4.x, C# 5).
+// Windows 11 Task Manager-style UI. Compiles with the csc.exe that ships with Windows (.NET Framework 4.x, C# 5).
 using System;
-using System.Collections;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.Drawing;
+using System.Drawing.Drawing2D;
 using System.IO;
 using System.Linq;
-using System.Security;
 using System.Security.Principal;
-using System.Text;
 using System.Threading;
 using System.Windows.Forms;
+using Microsoft.Win32;
 
 [assembly: System.Reflection.AssemblyTitle("Affinity Manager")]
 [assembly: System.Reflection.AssemblyProduct("Affinity Manager")]
-[assembly: System.Reflection.AssemblyVersion("1.0.0.0")]
-[assembly: System.Reflection.AssemblyFileVersion("1.0.0.0")]
+[assembly: System.Reflection.AssemblyVersion("2.0.0.0")]
+[assembly: System.Reflection.AssemblyFileVersion("2.0.0.0")]
 
 namespace AffinityManager
 {
-    class Rule
+    class ProcGroup
     {
-        public string Name;      // process name without ".exe"
-        public string Priority;  // ProcessPriorityClass name, "" = don't change
-        public long Mask;        // affinity bit mask, 0 = don't change
+        public string Name, Exe, Display;
+        public List<ProcInfo> Procs;
+        public bool Single;
     }
 
-    static class Store
+    // Right-hand panel: priority dropdown, core picker and action buttons.
+    class DetailsPane : SurfacePanel
     {
-        public static readonly string Dir = Path.Combine(
-            Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "AffinityManager");
-        static string RulesFile { get { return Path.Combine(Dir, "rules.txt"); } }
-        static string SettingsFile { get { return Path.Combine(Dir, "settings.txt"); } }
+        public readonly FluentLabel Title, Sub, Info, PriLabel, AffLabel, Status, Empty;
+        public readonly FluentDropDown Priority;
+        public readonly ToggleSwitch Limit;
+        public readonly CoreGrid Cores;
+        public readonly FluentButton All, None, Primary, Secondary;
+        public Image HeaderIcon;
+        bool empty = true;
 
-        public static List<Rule> LoadRules()
+        static int P(float v) { return Theme.Px(v); }
+
+        public DetailsPane(int cpuCount, long allowed)
         {
-            var list = new List<Rule>();
-            try
-            {
-                if (!File.Exists(RulesFile)) return list;
-                foreach (var line in File.ReadAllLines(RulesFile))
-                {
-                    var parts = line.Split('|');
-                    if (parts.Length < 3 || parts[0].Trim().Length == 0) continue;
-                    long mask;
-                    long.TryParse(parts[2].Trim(), out mask);
-                    list.Add(new Rule { Name = parts[0].Trim(), Priority = parts[1].Trim(), Mask = mask });
-                }
-            }
-            catch { }
-            return list;
+            LeftDivider = true;
+            Title = new FluentLabel { Font = Theme.Subtitle };
+            Sub = new FluentLabel { Kind = LabelKind.Secondary, Font = Theme.Small };
+            Info = new FluentLabel { Kind = LabelKind.Secondary, Font = Theme.Small, Wrap = true };
+            PriLabel = new FluentLabel { Text = "Priority", Font = Theme.UISemibold };
+            Priority = new FluentDropDown { Items = new[] { "Don't change" }.Concat(Engine.PriorityLabels).ToArray() };
+            AffLabel = new FluentLabel { Text = "Processor affinity", Font = Theme.UISemibold };
+            Limit = new ToggleSwitch { Text = "Only use the cores selected below" };
+            Cores = new CoreGrid(cpuCount, allowed);
+            All = new FluentButton { Text = "Select all", Kind = ButtonKind.Subtle };
+            None = new FluentButton { Text = "Clear", Kind = ButtonKind.Subtle };
+            Primary = new FluentButton { Kind = ButtonKind.Accent };
+            Secondary = new FluentButton();
+            Status = new FluentLabel { Kind = LabelKind.Secondary, Font = Theme.Small, Wrap = true };
+            Empty = new FluentLabel { Kind = LabelKind.Secondary, Wrap = true, Center = true };
+            Controls.AddRange(new Control[] { Title, Sub, Info, PriLabel, Priority, AffLabel, Limit, Cores, All, None, Primary, Secondary, Status, Empty });
+            Limit.CheckedChanged += delegate { Cores.Enabled = All.Enabled = None.Enabled = Limit.Checked; };
+            All.Click += delegate { Cores.Mask = allowed; };
+            None.Click += delegate { Cores.Mask = 0; };
+            Cores.Enabled = All.Enabled = None.Enabled = false;
+            SetVisibility();
         }
 
-        public static void SaveRules(List<Rule> rules)
+        public void ShowEmpty(string text)
         {
-            Directory.CreateDirectory(Dir);
-            File.WriteAllLines(RulesFile, rules.Select(r => r.Name + "|" + r.Priority + "|" + r.Mask).ToArray());
+            empty = true;
+            Empty.Text = text;
+            HeaderIcon = null;
+            SetVisibility();
+            Invalidate();
         }
 
-        public static Dictionary<string, string> LoadSettings()
+        public void ShowEditor(Image icon, string title, string sub, string info, int priIndex, bool limit, long mask,
+            string primary, string primaryGlyph, string secondary, string secondaryGlyph, bool canEdit)
         {
-            var d = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
-            try
-            {
-                if (File.Exists(SettingsFile))
-                    foreach (var line in File.ReadAllLines(SettingsFile))
-                    {
-                        int i = line.IndexOf('=');
-                        if (i > 0) d[line.Substring(0, i).Trim()] = line.Substring(i + 1).Trim();
-                    }
-            }
-            catch { }
-            return d;
+            empty = false;
+            HeaderIcon = icon;
+            Title.Text = title;
+            Sub.Text = sub;
+            Info.Text = info;
+            Priority.SelectedIndex = priIndex;
+            Limit.Checked = limit;
+            Cores.Enabled = All.Enabled = None.Enabled = limit;
+            Cores.Mask = mask;
+            Primary.Text = primary; Primary.Glyph = primaryGlyph;
+            Secondary.Text = secondary; Secondary.Glyph = secondaryGlyph;
+            Priority.Enabled = Limit.Enabled = Primary.Enabled = canEdit;
+            Secondary.Enabled = canEdit || secondary == "Forget";
+            if (!canEdit) Cores.Enabled = All.Enabled = None.Enabled = false;
+            Status.Text = canEdit ? "" : "Windows doesn't allow changing this process.";
+            SetVisibility();
+            Invalidate();
         }
 
-        public static void SaveSettings(Dictionary<string, string> d)
+        void SetVisibility()
         {
-            try
+            foreach (Control c in Controls) c.Visible = (c == Empty) == empty;
+        }
+
+        protected override void OnLayout(LayoutEventArgs e)
+        {
+            base.OnLayout(e);
+            int pad = P(20), x = pad + 1, w = Width - pad * 2 - 1;
+            if (w < P(60)) return;
+            int y = P(20);
+            Title.SetBounds(x + P(44), y - P(1), w - P(44), P(22));
+            Sub.SetBounds(x + P(44), y + P(20), w - P(44), P(18));
+            y += P(50);
+            Info.SetBounds(x, y, w, P(36)); y += P(46);
+            PriLabel.SetBounds(x, y, w, P(20)); y += P(24);
+            Priority.SetBounds(x, y, w, P(32)); y += P(48);
+            AffLabel.SetBounds(x, y, w, P(20)); y += P(26);
+            Limit.SetBounds(x, y, w, P(24)); y += P(34);
+            int by = Height - pad;
+            Status.SetBounds(x, by - P(36), w, P(36)); by -= P(36) + P(6);
+            Secondary.SetBounds(x, by - P(32), w, P(32)); by -= P(32) + P(8);
+            Primary.SetBounds(x, by - P(34), w, P(34)); by -= P(34) + P(16);
+            All.SetBounds(x - P(4), by - P(28), P(86), P(28));
+            None.SetBounds(x + P(86), by - P(28), P(64), P(28));
+            by -= P(28) + P(6);
+            Cores.SetBounds(x, y, w, Math.Max(P(40), by - y));
+            Empty.SetBounds(x, P(80), w, P(100));
+        }
+
+        protected override void OnPaint(PaintEventArgs e)
+        {
+            base.OnPaint(e);
+            if (empty) return;
+            var g = e.Graphics;
+            g.SmoothingMode = SmoothingMode.AntiAlias;
+            g.InterpolationMode = InterpolationMode.HighQualityBicubic;
+            var r = new Rectangle(P(20) + 1, P(20), P(32), P(32));
+            if (HeaderIcon != null) g.DrawImage(HeaderIcon, r);
+            else
             {
-                Directory.CreateDirectory(Dir);
-                File.WriteAllLines(SettingsFile, d.Select(kv => kv.Key + "=" + kv.Value).ToArray());
+                var rf = new RectangleF(r.X + 0.5f, r.Y + 0.5f, r.Width - 1, r.Height - 1);
+                Theme.FillRound(g, Theme.ControlFill, rf, P(6));
+                Theme.DrawRound(g, Theme.ControlBorder, rf, P(6));
+                Theme.DrawGlyph(g, "", Theme.IconNav, Theme.TextSecondary, r);
             }
-            catch { }
         }
     }
 
-    // Autostart through Task Scheduler: lets the elevated app start at sign-in without a UAC prompt.
-    static class Autostart
+    class SettingsPage : SurfacePanel
     {
-        const string TaskName = "AffinityManager";
+        public readonly ToggleSwitch Startup, Tray, Protected;
+        public readonly FluentButton Folder;
+        public readonly FluentLabel About;
+        readonly Card[] cards;
+        readonly FluentLabel section;
 
-        static int Schtasks(string args, out string output)
+        static int P(float v) { return Theme.Px(v); }
+
+        static Card MakeCard(string glyph, string title, string desc, Control accessory)
         {
-            var psi = new ProcessStartInfo("schtasks.exe", args)
+            var c = new Card { Glyph = glyph, Title = title, Description = desc, Accessory = accessory };
+            c.Controls.Add(accessory);
+            return c;
+        }
+
+        public SettingsPage()
+        {
+            section = new FluentLabel { Text = "General", Font = Theme.UISemibold };
+            Startup = new ToggleSwitch { StateText = true, Size = new Size(P(96), P(28)) };
+            Tray = new ToggleSwitch { StateText = true, Size = new Size(P(96), P(28)) };
+            Protected = new ToggleSwitch { StateText = true, Size = new Size(P(96), P(28)) };
+            Folder = new FluentButton { Text = "Open folder", Size = new Size(P(120), P(32)) };
+            About = new FluentLabel { Kind = LabelKind.Secondary, Font = Theme.Small, Wrap = true };
+            cards = new[]
             {
-                UseShellExecute = false,
-                CreateNoWindow = true,
-                RedirectStandardOutput = true,
-                RedirectStandardError = true
+                MakeCard("", "Start with Windows", "Runs quietly in the system tray after you sign in, so remembered settings are always applied.", Startup),
+                MakeCard("", "Keep running when the window is closed", "Closing the window hides it to the tray. Remembered settings only apply while the app runs.", Tray),
+                MakeCard("", "Show protected system processes", "Windows doesn't allow changing these, so they're hidden by default.", Protected),
+                MakeCard("", "Settings folder", Store.Dir, Folder),
             };
-            using (var p = Process.Start(psi))
-            {
-                output = p.StandardOutput.ReadToEnd() + p.StandardError.ReadToEnd();
-                p.WaitForExit();
-                return p.ExitCode;
-            }
+            Controls.Add(section);
+            Controls.AddRange(cards);
+            Controls.Add(About);
         }
 
-        public static bool IsEnabled()
+        protected override void OnLayout(LayoutEventArgs e)
         {
-            try { string o; return Schtasks("/Query /TN \"" + TaskName + "\"", out o) == 0; }
-            catch { return false; }
-        }
-
-        public static void Enable()
-        {
-            string user = SecurityElement.Escape(WindowsIdentity.GetCurrent().Name);
-            string exe = SecurityElement.Escape(Application.ExecutablePath);
-            string xml =
-"<?xml version=\"1.0\" encoding=\"UTF-16\"?>\r\n" +
-"<Task version=\"1.2\" xmlns=\"http://schemas.microsoft.com/windows/2004/02/mit/task\">\r\n" +
-"  <RegistrationInfo><Description>Starts Affinity Manager in the tray and applies saved CPU priority/affinity rules.</Description></RegistrationInfo>\r\n" +
-"  <Triggers><LogonTrigger><Enabled>true</Enabled><UserId>" + user + "</UserId><Delay>PT5S</Delay></LogonTrigger></Triggers>\r\n" +
-"  <Principals><Principal id=\"Author\"><UserId>" + user + "</UserId><LogonType>InteractiveToken</LogonType><RunLevel>HighestAvailable</RunLevel></Principal></Principals>\r\n" +
-"  <Settings>\r\n" +
-"    <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>\r\n" +
-"    <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>\r\n" +
-"    <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>\r\n" +
-"    <ExecutionTimeLimit>PT0S</ExecutionTimeLimit>\r\n" +
-"    <Priority>7</Priority>\r\n" +
-"  </Settings>\r\n" +
-"  <Actions Context=\"Author\"><Exec><Command>" + exe + "</Command><Arguments>--tray</Arguments></Exec></Actions>\r\n" +
-"</Task>\r\n";
-            string tmp = Path.Combine(Path.GetTempPath(), "AffinityManagerTask.xml");
-            File.WriteAllText(tmp, xml, Encoding.Unicode);
-            try
-            {
-                string o;
-                if (Schtasks("/Create /TN \"" + TaskName + "\" /XML \"" + tmp + "\" /F", out o) != 0)
-                    throw new Exception(o.Trim());
-            }
-            finally { try { File.Delete(tmp); } catch { } }
-        }
-
-        public static void Disable()
-        {
-            string o;
-            if (Schtasks("/Delete /TN \"" + TaskName + "\" /F", out o) != 0)
-                throw new Exception(o.Trim());
+            base.OnLayout(e);
+            int x = P(16), w = Math.Min(Width - P(40), P(1000)), y = P(4);
+            section.SetBounds(x, y, w, P(22)); y += P(30);
+            foreach (var c in cards) { c.SetBounds(x, y, w, P(70)); y += P(74); }
+            y += P(16);
+            About.SetBounds(x, y, w, P(60));
         }
     }
 
-    class ListViewSorter : IComparer
+    class MainForm : Form, ISurface
     {
-        public int Column;
-        public bool Ascending = true;
-        public int[] NumericColumns = new int[0];
-
-        public int Compare(object a, object b)
-        {
-            var x = ((ListViewItem)a).SubItems[Column].Text;
-            var y = ((ListViewItem)b).SubItems[Column].Text;
-            int r;
-            if (NumericColumns.Contains(Column))
-            {
-                long lx, ly;
-                long.TryParse(x, out lx);
-                long.TryParse(y, out ly);
-                r = lx.CompareTo(ly);
-            }
-            else r = string.Compare(x, y, StringComparison.OrdinalIgnoreCase);
-            return Ascending ? r : -r;
-        }
-    }
-
-    class MainForm : Form
-    {
-        static readonly string[] PriorityNames = { "Idle", "BelowNormal", "Normal", "AboveNormal", "High", "RealTime" };
-        static readonly string[] PriorityLabels = { "Low", "Below normal", "Normal", "Above normal", "High", "Realtime" };
-
         List<Rule> rules;
-        Dictionary<string, string> settings;
+        readonly Dictionary<string, string> settings;
+        readonly Dictionary<string, string> knownDesc = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        readonly Dictionary<string, Image> knownIcon = new Dictionary<string, Image>(StringComparer.OrdinalIgnoreCase);
         readonly bool isAdmin;
         readonly long allMask;
         readonly int cpuCount;
-        bool allowVisible, exiting, balloonShown, suppressEvents;
+        bool allowVisible, exiting, balloonShown, busy, suppress;
+        int page;
+        readonly Sampler sampler;
+        Snapshot latest;
 
-        TabControl tabs;
-        TabPage tabProc, tabRules;
-        ListView lvProc, lvRules;
-        TextBox txtFilter;
-        CheckBox chkHideDenied;
-        ComboBox cboPriority;
-        CheckBox chkSetAffinity;
-        FlowLayoutPanel cpuPanel;
-        CheckBox[] cpuBoxes;
-        Button btnAll, btnNone, btnApplyOnce, btnSave;
-        Label lblStatus;
-        CheckBox chkStartup, chkCloseToTray;
+        NavRail nav;
+        SurfaceHost host;
+        SurfacePanel header;
+        FluentLabel lblPage;
+        SearchBox search;
+        FluentButton btnAdd;
+        FluentGrid gridProc, gridRules;
+        DetailsPane pane;
+        SettingsPage settingsPage;
         NotifyIcon tray;
-        System.Windows.Forms.Timer enforceTimer;
+        ContextMenuStrip lastMenu;
+        System.Windows.Forms.Timer timer;
+
+        static int P(float v) { return Theme.Px(v); }
+        public Color SurfaceColor { get { return Theme.Window; } }
 
         public MainForm(bool startInTray, EventWaitHandle showSignal)
         {
             allowVisible = !startInTray;
-
             isAdmin = new WindowsPrincipal(WindowsIdentity.GetCurrent()).IsInRole(WindowsBuiltInRole.Administrator);
-            try { allMask = (long)Process.GetCurrentProcess().ProcessorAffinity; }
-            catch { allMask = 0; }
+            try { allMask = (long)Process.GetCurrentProcess().ProcessorAffinity; } catch { allMask = 0; }
             if (allMask == 0)
             {
                 int n = Math.Min(Environment.ProcessorCount, 64);
                 allMask = n >= 64 ? -1L : (1L << n) - 1;
             }
-            cpuCount = 0;
-            for (int i = 0; i < 64; i++) if ((allMask & (1L << i)) != 0) cpuCount = i + 1;
+            for (int i = 0; i < 64; i++) if (((allMask >> i) & 1) != 0) cpuCount = i + 1;
+            Engine.AllMask = allMask;
+            Engine.CpuCount = cpuCount;
 
             rules = Store.LoadRules();
             settings = Store.LoadSettings();
+            sampler = new Sampler(P(32));
 
             BuildUi();
 
-            // Keep the autostart task pointing at this exe if it was moved.
-            if (!startInTray && chkStartup.Checked)
+#if !TESTBUILD
+            if (!startInTray && settingsPage.Startup.Checked)
             {
                 try { Autostart.Enable(); } catch { }
             }
+#endif
 
-            EnforceRules();
-            enforceTimer = new System.Windows.Forms.Timer { Interval = 2000 };
-            enforceTimer.Tick += delegate { EnforceRules(); };
-            enforceTimer.Start();
+            Engine.Enforce(rules.Select(r => r.Clone()).ToArray());
+            timer = new System.Windows.Forms.Timer { Interval = 2000 };
+            timer.Tick += delegate { Tick(); };
+            timer.Start();
 
             if (showSignal != null)
             {
@@ -247,207 +268,176 @@ namespace AffinityManager
                 t.Start();
             }
 
-            if (allowVisible) RefreshProcesses();
-            RefreshRules();
+            SystemEvents.UserPreferenceChanged += OnPreferenceChanged;
+            if (allowVisible) Tick();
         }
 
-        // ---------- UI ----------
+        bool Setting(string key, bool def)
+        {
+            string v;
+            return settings.TryGetValue(key, out v) ? v == "1" : def;
+        }
+
+        void SetSetting(string key, bool value)
+        {
+            settings[key] = value ? "1" : "0";
+            Store.SaveSettings(settings);
+        }
+
+        // ---------- UI construction ----------
 
         void BuildUi()
         {
             SuspendLayout();
-            AutoScaleDimensions = new SizeF(96F, 96F);
-            AutoScaleMode = AutoScaleMode.Dpi;
-            Text = "Affinity Manager" + (isAdmin ? "" : "  (not running as administrator)");
-            Font = new Font("Segoe UI", 9F);
-            ClientSize = new Size(940, 600);
-            MinimumSize = new Size(760, 480);
+            AutoScaleMode = AutoScaleMode.None;
+            Text = "Affinity Manager";
+            Font = Theme.UI;
+            BackColor = Theme.Window;
+            var wa = Screen.PrimaryScreen.WorkingArea;
+            ClientSize = new Size(Math.Min(P(1240), wa.Width - 40), Math.Min(P(760), wa.Height - 40));
+            MinimumSize = new Size(Math.Min(P(940), wa.Width), Math.Min(P(620), wa.Height));
             StartPosition = FormStartPosition.CenterScreen;
             try { Icon = Icon.ExtractAssociatedIcon(Application.ExecutablePath); } catch { Icon = SystemIcons.Application; }
 
-            // --- Processes tab ---
-            tabProc = new TabPage("Running programs");
-            lvProc = MakeListView();
-            lvProc.Columns.Add("Program", 200);
-            lvProc.Columns.Add("PID", 64, HorizontalAlignment.Right);
-            lvProc.Columns.Add("Priority", 100);
-            lvProc.Columns.Add("Affinity (CPUs)", 120);
-            lvProc.Columns.Add("Remembered", 90);
-            var procSorter = new ListViewSorter { NumericColumns = new[] { 1 } };
-            lvProc.ListViewItemSorter = procSorter;
-            lvProc.ColumnClick += delegate (object s, ColumnClickEventArgs e) { SortBy(lvProc, procSorter, e.Column); };
-            lvProc.SelectedIndexChanged += delegate { OnProcessSelected(); };
+            // Navigation
+            nav = new NavRail { Dock = DockStyle.Left };
+            nav.Items.Add(new NavItem { Glyph = "", Text = "Processes" });
+            nav.Items.Add(new NavItem { Glyph = "", Text = "Remembered" });
+            nav.Items.Add(new NavItem { Glyph = "", Text = "Settings", Bottom = true });
+            nav.Expanded = Setting("navExpanded", true);
+            nav.Width = nav.Expanded ? P(200) : P(48);
+            nav.ExpandedChanged += delegate
+            {
+                nav.Width = nav.Expanded ? P(200) : P(48);
+                SetSetting("navExpanded", nav.Expanded);
+            };
+            nav.SelectedChanged += delegate { ShowPage(nav.SelectedIndex); };
 
-            var topBar = new Panel { Dock = DockStyle.Top, Height = 36 };
-            var lblFilter = new Label { Text = "Search:", Left = 4, Top = 10, AutoSize = true };
-            txtFilter = new TextBox { Left = 56, Top = 7, Width = 200 };
-            txtFilter.TextChanged += delegate { RefreshProcesses(); };
-            var btnRefresh = new Button { Text = "Refresh", Left = 264, Top = 5, Width = 84, Height = 26 };
-            btnRefresh.Click += delegate { RefreshProcesses(); };
-            chkHideDenied = new CheckBox { Text = "Hide protected system processes", Left = 360, Top = 9, AutoSize = true, Checked = true };
-            chkHideDenied.CheckedChanged += delegate { RefreshProcesses(); };
-            topBar.Controls.AddRange(new Control[] { lblFilter, txtFilter, btnRefresh, chkHideDenied });
+            host = new SurfaceHost { Dock = DockStyle.Fill, Padding = new Padding(P(6), P(4), 0, 0) };
 
-            tabProc.Controls.Add(lvProc);
-            tabProc.Controls.Add(topBar);
-            tabProc.Padding = new Padding(4);
-
-            // --- Rules tab ---
-            tabRules = new TabPage("Remembered programs");
-            lvRules = MakeListView();
-            lvRules.Columns.Add("Program", 240);
-            lvRules.Columns.Add("Priority", 120);
-            lvRules.Columns.Add("Affinity (CPUs)", 200);
-            var ruleSorter = new ListViewSorter();
-            lvRules.ListViewItemSorter = ruleSorter;
-            lvRules.ColumnClick += delegate (object s, ColumnClickEventArgs e) { SortBy(lvRules, ruleSorter, e.Column); };
-            lvRules.SelectedIndexChanged += delegate { OnRuleSelected(); };
-
-            var ruleBar = new Panel { Dock = DockStyle.Bottom, Height = 40 };
-            var btnAdd = new Button { Text = "Add program (.exe)...", Left = 0, Top = 6, Width = 160, Height = 28 };
+            // Header: page title, command button, search
+            header = new SurfacePanel { Dock = DockStyle.Top, Height = P(64) };
+            lblPage = new FluentLabel { Font = Theme.Title, VCenter = true };
+            search = new SearchBox { Placeholder = "Search by name" };
+            search.QueryChanged += delegate { RefreshGrids(); };
+            btnAdd = new FluentButton { Text = "Add program", Glyph = "", Kind = ButtonKind.Subtle };
             btnAdd.Click += delegate { AddRuleFromFile(); };
-            var btnRemove = new Button { Text = "Forget selected", Left = 168, Top = 6, Width = 130, Height = 28 };
-            btnRemove.Click += delegate { RemoveSelectedRules(); };
-            var lblHint = new Label
+            header.Controls.AddRange(new Control[] { lblPage, btnAdd, search });
+            header.Resize += delegate { LayoutHeader(); };
+
+            // Processes grid
+            gridProc = new FluentGrid { Dock = DockStyle.Fill, EmptyText = "Loading…" };
+            gridProc.Columns.Add(new GridColumn { Title = "Name" });
+            gridProc.Columns.Add(new GridColumn { Title = "CPU", Width = 72, Right = true, Numeric = true, Heat = true });
+            gridProc.Columns.Add(new GridColumn { Title = "Memory", Width = 96, Right = true, Numeric = true, Heat = true });
+            gridProc.Columns.Add(new GridColumn { Title = "Priority", Width = 104, Numeric = true });
+            gridProc.Columns.Add(new GridColumn { Title = "Cores", Width = 92, Numeric = true });
+            gridProc.Columns.Add(new GridColumn { Title = "Saved", Width = 58, Numeric = true, Glyph = true });
+            gridProc.SelectionChanged += delegate { if (page == 0) OnProcSelection(); };
+            gridProc.RowContextMenu += ProcContextMenu;
+
+            // Remembered grid
+            gridRules = new FluentGrid { Dock = DockStyle.Fill };
+            gridRules.Columns.Add(new GridColumn { Title = "Name" });
+            gridRules.Columns.Add(new GridColumn { Title = "Priority", Width = 120, Numeric = true });
+            gridRules.Columns.Add(new GridColumn { Title = "Cores", Width = 150, Numeric = true });
+            gridRules.Columns.Add(new GridColumn { Title = "Running", Width = 96, Right = true, Numeric = true });
+            gridRules.SelectionChanged += delegate { if (page == 1) OnRuleSelection(); };
+            gridRules.RowContextMenu += RulesContextMenu;
+
+            // Details pane
+            pane = new DetailsPane(cpuCount, allMask) { Dock = DockStyle.Right, Width = P(300) };
+            pane.Primary.Click += delegate { if (page == 0) RememberFromEditor(); else SaveRuleEdits(); };
+            pane.Secondary.Click += delegate { if (page == 0) ApplyOnce(); else Forget(SelectedRuleNames()); };
+
+            // Settings
+            settingsPage = new SettingsPage { Dock = DockStyle.Fill };
+            suppress = true;
+            settingsPage.Startup.Checked = Autostart.IsEnabled();
+            settingsPage.Tray.Checked = Setting("closeToTray", true);
+            settingsPage.Protected.Checked = Setting("showProtected", false);
+            suppress = false;
+            settingsPage.Startup.CheckedChanged += delegate { OnStartupToggled(); };
+            settingsPage.Tray.CheckedChanged += delegate { SetSetting("closeToTray", settingsPage.Tray.Checked); };
+            settingsPage.Protected.CheckedChanged += delegate { SetSetting("showProtected", settingsPage.Protected.Checked); RefreshGrids(); };
+            settingsPage.Folder.Click += delegate
             {
-                Text = "Remembered settings are applied automatically whenever these programs run.",
-                Left = 310, Top = 12, AutoSize = true, ForeColor = SystemColors.GrayText
+                try { Directory.CreateDirectory(Store.Dir); Process.Start("explorer.exe", "\"" + Store.Dir + "\""); } catch { }
             };
-            ruleBar.Controls.AddRange(new Control[] { btnAdd, btnRemove, lblHint });
+            settingsPage.About.Text = "Affinity Manager 2.0  ·  " +
+                (isAdmin ? "Running as administrator" : "Not running as administrator, so some programs can't be changed") +
+                "  ·  " + cpuCount + " logical processors  ·  Colours follow your Windows theme";
 
-            tabRules.Controls.Add(lvRules);
-            tabRules.Controls.Add(ruleBar);
-            tabRules.Padding = new Padding(4);
+            host.Controls.Add(gridProc);
+            host.Controls.Add(gridRules);
+            host.Controls.Add(settingsPage);
+            host.Controls.Add(pane);
+            host.Controls.Add(header);
+            Controls.Add(host);
+            Controls.Add(nav);
 
-            tabs = new TabControl { Dock = DockStyle.Fill };
-            tabs.TabPages.Add(tabProc);
-            tabs.TabPages.Add(tabRules);
-            tabs.SelectedIndexChanged += delegate { UpdateEditorMode(); };
-
-            // --- Editor (right side) ---
-            var editor = new TableLayoutPanel { Dock = DockStyle.Right, Width = 300, ColumnCount = 1, RowCount = 4, Padding = new Padding(6, 26, 6, 6) };
-            editor.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
-            editor.RowStyles.Add(new RowStyle(SizeType.Absolute, 64));
-            editor.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
-            editor.RowStyles.Add(new RowStyle(SizeType.Absolute, 84));
-            editor.RowStyles.Add(new RowStyle(SizeType.Absolute, 70));
-
-            var grpPri = new GroupBox { Text = "Priority", Dock = DockStyle.Fill };
-            cboPriority = new ComboBox { DropDownStyle = ComboBoxStyle.DropDownList, Dock = DockStyle.Top };
-            cboPriority.Items.Add("(don't change)");
-            cboPriority.Items.AddRange(PriorityLabels);
-            cboPriority.SelectedIndex = 0;
-            grpPri.Controls.Add(cboPriority);
-
-            var grpAff = new GroupBox { Text = "CPU affinity (which cores it may use)", Dock = DockStyle.Fill };
-            chkSetAffinity = new CheckBox { Text = "Change affinity", Dock = DockStyle.Top, Height = 24, Checked = true };
-            chkSetAffinity.CheckedChanged += delegate { cpuPanel.Enabled = btnAll.Enabled = btnNone.Enabled = chkSetAffinity.Checked; };
-            cpuPanel = new FlowLayoutPanel { Dock = DockStyle.Fill, AutoScroll = true };
-            var cpuList = new List<CheckBox>();
-            for (int i = 0; i < cpuCount; i++)
-            {
-                var cb = new CheckBox { Text = "CPU " + i, Width = 78, Checked = true, Tag = i };
-                if ((allMask & (1L << i)) == 0) cb.Enabled = false;
-                cpuList.Add(cb);
-                cpuPanel.Controls.Add(cb);
-            }
-            cpuBoxes = cpuList.ToArray();
-            var affButtons = new FlowLayoutPanel { Dock = DockStyle.Bottom, Height = 34 };
-            btnAll = new Button { Text = "All", Width = 70, Height = 26 };
-            btnAll.Click += delegate { SetCpuBoxes(allMask); };
-            btnNone = new Button { Text = "None", Width = 70, Height = 26 };
-            btnNone.Click += delegate { SetCpuBoxes(0); };
-            affButtons.Controls.Add(btnAll);
-            affButtons.Controls.Add(btnNone);
-            grpAff.Controls.Add(cpuPanel);
-            grpAff.Controls.Add(affButtons);
-            grpAff.Controls.Add(chkSetAffinity);
-
-            var btnPanel = new Panel { Dock = DockStyle.Fill };
-            btnSave = new Button { Text = "Apply && remember", Dock = DockStyle.Top, Height = 34, Font = new Font(Font, FontStyle.Bold) };
-            btnSave.Click += delegate { SaveFromEditor(); };
-            var spacer = new Panel { Dock = DockStyle.Top, Height = 6 };
-            btnApplyOnce = new Button { Text = "Apply once (don't remember)", Dock = DockStyle.Top, Height = 30 };
-            btnApplyOnce.Click += delegate { ApplyOnce(); };
-            btnPanel.Controls.Add(btnApplyOnce);
-            btnPanel.Controls.Add(spacer);
-            btnPanel.Controls.Add(btnSave);
-
-            lblStatus = new Label { Dock = DockStyle.Fill, ForeColor = SystemColors.GrayText };
-
-            editor.Controls.Add(grpPri, 0, 0);
-            editor.Controls.Add(grpAff, 0, 1);
-            editor.Controls.Add(btnPanel, 0, 2);
-            editor.Controls.Add(lblStatus, 0, 3);
-
-            // --- Bottom options ---
-            var bottom = new Panel { Dock = DockStyle.Bottom, Height = 58, Padding = new Padding(8) };
-            chkStartup = new CheckBox { Text = "Start automatically when I sign in to Windows (runs quietly in the tray)", Left = 10, Top = 6, AutoSize = true };
-            chkCloseToTray = new CheckBox { Text = "Closing the window keeps it running in the tray (needed to keep applying remembered settings)", Left = 10, Top = 30, AutoSize = true };
-            bottom.Controls.Add(chkStartup);
-            bottom.Controls.Add(chkCloseToTray);
-
-            suppressEvents = true;
-            chkStartup.Checked = Autostart.IsEnabled();
-            string v;
-            chkCloseToTray.Checked = !settings.TryGetValue("closeToTray", out v) || v != "0";
-            suppressEvents = false;
-            chkStartup.CheckedChanged += delegate { OnStartupToggled(); };
-            chkCloseToTray.CheckedChanged += delegate
-            {
-                settings["closeToTray"] = chkCloseToTray.Checked ? "1" : "0";
-                Store.SaveSettings(settings);
-            };
-
-            Controls.Add(tabs);
-            Controls.Add(editor);
-            Controls.Add(bottom);
-
-            // --- Tray icon ---
-            var menu = new ContextMenuStrip();
-            menu.Items.Add("Open Affinity Manager", null, delegate { ShowFromTray(); });
-            menu.Items.Add("Apply remembered settings now", null, delegate { EnforceRules(); });
+            // Tray icon
+            var menu = Fluent.Menu();
+            menu.ShowCheckMargin = false;
+            menu.Items.Add(Fluent.Item("Open Affinity Manager", delegate { ShowFromTray(); }));
+            menu.Items.Add(Fluent.Item("Apply remembered settings now", delegate { Engine.Enforce(rules.Select(r => r.Clone()).ToArray()); }));
             menu.Items.Add(new ToolStripSeparator());
-            menu.Items.Add("Exit", null, delegate { ExitApp(); });
+            menu.Items.Add(Fluent.Item("Exit", delegate { ExitApp(); }));
             tray = new NotifyIcon { Icon = Icon, Text = "Affinity Manager", Visible = true, ContextMenuStrip = menu };
             tray.DoubleClick += delegate { ShowFromTray(); };
 
-            UpdateEditorMode();
-            SetStatus(isAdmin ? "" : "Not running as administrator: some programs can't be changed.");
+            ShowPage(0);
             ResumeLayout(true);
         }
 
-        static ListView MakeListView()
+        void LayoutHeader()
         {
-            return new ListView
+            int h = header.Height, x = P(18);
+            int tw = TextRenderer.MeasureText(lblPage.Text, Theme.Title).Width;
+            lblPage.SetBounds(x, 0, tw + P(8), h);
+            btnAdd.SetBounds(x + tw + P(20), (h - P(32)) / 2, P(132), P(32));
+            int sw = Math.Min(P(320), Math.Max(P(160), header.Width - (x + tw + P(180))));
+            search.SetBounds(header.Width - sw - P(20), (h - P(34)) / 2, sw, P(34));
+        }
+
+        void ShowPage(int i)
+        {
+            page = i;
+            lblPage.Text = i == 0 ? "Processes" : i == 1 ? "Remembered programs" : "Settings";
+            gridProc.Visible = i == 0;
+            gridRules.Visible = i == 1;
+            settingsPage.Visible = i == 2;
+            pane.Visible = i != 2;
+            search.Visible = i != 2;
+            btnAdd.Visible = i == 1;
+            LayoutHeader();
+            if (i == 0) OnProcSelection();
+            else if (i == 1) { UpdateRulesGrid(); OnRuleSelection(); }
+        }
+
+        // ---------- theme ----------
+
+        protected override void OnHandleCreated(EventArgs e)
+        {
+            base.OnHandleCreated(e);
+            Native.StyleWindow(Handle, Theme.Dark, Theme.Window, Theme.Text);
+        }
+
+        void OnPreferenceChanged(object sender, UserPreferenceChangedEventArgs e)
+        {
+            try
             {
-                Dock = DockStyle.Fill,
-                View = View.Details,
-                FullRowSelect = true,
-                HideSelection = false,
-                MultiSelect = true,
-                GridLines = false
-            };
+                BeginInvoke((MethodInvoker)delegate
+                {
+                    if (!Theme.Load()) return;
+                    BackColor = Theme.Window;
+                    Native.StyleWindow(Handle, Theme.Dark, Theme.Window, Theme.Text);
+                    search.ApplyColors();
+                    Invalidate(true);
+                });
+            }
+            catch { }
         }
-
-        static void SortBy(ListView lv, ListViewSorter sorter, int col)
-        {
-            if (sorter.Column == col) sorter.Ascending = !sorter.Ascending;
-            else { sorter.Column = col; sorter.Ascending = true; }
-            lv.Sort();
-        }
-
-        void UpdateEditorMode()
-        {
-            bool procTab = OnProcTab;
-            btnApplyOnce.Visible = procTab;
-            btnSave.Text = procTab ? "Apply && remember" : "Save changes to selected";
-        }
-
-        // SelectedIndex is -1 until the tab control's handle exists; treat that as the first tab.
-        bool OnProcTab { get { return tabs.SelectedIndex <= 0; } }
-
-        void SetStatus(string text) { lblStatus.Text = text; }
 
         // ---------- show / hide / tray ----------
 
@@ -467,13 +457,12 @@ namespace AffinityManager
             Show();
             if (WindowState == FormWindowState.Minimized) WindowState = FormWindowState.Normal;
             Activate();
-            RefreshProcesses();
-            RefreshRules();
+            Tick();
         }
 
         protected override void OnFormClosing(FormClosingEventArgs e)
         {
-            if (!exiting && chkCloseToTray.Checked && e.CloseReason == CloseReason.UserClosing)
+            if (!exiting && settingsPage.Tray.Checked && e.CloseReason == CloseReason.UserClosing)
             {
                 e.Cancel = true;
                 Hide();
@@ -489,6 +478,7 @@ namespace AffinityManager
 
         protected override void OnFormClosed(FormClosedEventArgs e)
         {
+            SystemEvents.UserPreferenceChanged -= OnPreferenceChanged;
             tray.Visible = false;
             tray.Dispose();
             base.OnFormClosed(e);
@@ -503,241 +493,508 @@ namespace AffinityManager
 
         void OnStartupToggled()
         {
-            if (suppressEvents) return;
+            if (suppress) return;
             try
             {
-                if (chkStartup.Checked) Autostart.Enable();
+                if (settingsPage.Startup.Checked) Autostart.Enable();
                 else Autostart.Disable();
             }
             catch (Exception ex)
             {
                 MessageBox.Show(this, "Couldn't change the startup setting:\n\n" + ex.Message, "Affinity Manager",
                     MessageBoxButtons.OK, MessageBoxIcon.Warning);
-                suppressEvents = true;
-                chkStartup.Checked = Autostart.IsEnabled();
-                suppressEvents = false;
+                suppress = true;
+                settingsPage.Startup.Checked = Autostart.IsEnabled();
+                suppress = false;
             }
         }
 
-        // ---------- helpers ----------
+        // ---------- background refresh ----------
 
-        static string PriorityLabel(string name)
+        void Tick()
         {
-            int i = Array.IndexOf(PriorityNames, name);
-            return i >= 0 ? PriorityLabels[i] : (name.Length == 0 ? "(unchanged)" : name);
-        }
-
-        string MaskToString(long mask)
-        {
-            if (mask == 0) return "(unchanged)";
-            if (mask == allMask) return "All (" + cpuCount + ")";
-            var parts = new List<string>();
-            int i = 0;
-            while (i < 64)
+            if (busy) return;
+            busy = true;
+            var rulesCopy = rules.Select(r => r.Clone()).ToArray();
+            bool wantSnapshot = Visible && WindowState != FormWindowState.Minimized;
+            ThreadPool.QueueUserWorkItem(delegate
             {
-                if ((mask & (1L << i)) != 0)
+                Snapshot snap = null;
+                try
                 {
-                    int start = i;
-                    while (i + 1 < 64 && (mask & (1L << (i + 1))) != 0) i++;
-                    parts.Add(start == i ? start.ToString() : start + "-" + i);
+                    Engine.Enforce(rulesCopy);
+                    if (wantSnapshot) snap = sampler.Take();
                 }
-                i++;
-            }
-            return string.Join(", ", parts.ToArray());
-        }
-
-        void SetCpuBoxes(long mask)
-        {
-            foreach (var cb in cpuBoxes)
-                cb.Checked = (mask & (1L << (int)cb.Tag)) != 0;
-        }
-
-        void LoadEditor(string priority, long mask)
-        {
-            int i = Array.IndexOf(PriorityNames, priority);
-            cboPriority.SelectedIndex = i >= 0 ? i + 1 : 0;
-            chkSetAffinity.Checked = mask != 0;
-            SetCpuBoxes(mask != 0 ? mask : allMask);
-        }
-
-        bool ReadEditor(out string priority, out long mask)
-        {
-            priority = cboPriority.SelectedIndex > 0 ? PriorityNames[cboPriority.SelectedIndex - 1] : "";
-            mask = 0;
-            if (chkSetAffinity.Checked)
-            {
-                foreach (var cb in cpuBoxes)
-                    if (cb.Checked) mask |= 1L << (int)cb.Tag;
-                mask &= allMask;
-                if (mask == 0)
+                catch { }
+                try
                 {
-                    MessageBox.Show(this, "Tick at least one CPU (or untick \"Change affinity\").", "Affinity Manager",
-                        MessageBoxButtons.OK, MessageBoxIcon.Information);
-                    return false;
+                    BeginInvoke((MethodInvoker)delegate
+                    {
+                        busy = false;
+                        if (snap != null) OnSnapshot(snap);
+                    });
                 }
-            }
-            if (priority == "RealTime")
-            {
-                var r = MessageBox.Show(this,
-                    "Realtime priority can make Windows unresponsive (mouse, keyboard, audio) if the program uses a lot of CPU.\n\n" +
-                    "\"High\" is usually what you want. Use Realtime anyway?",
-                    "Affinity Manager", MessageBoxButtons.YesNo, MessageBoxIcon.Warning, MessageBoxDefaultButton.Button2);
-                if (r != DialogResult.Yes) return false;
-            }
-            return true;
+                catch { busy = false; }
+            });
         }
 
-        void ApplyTo(Process p, string priority, long mask)
+        void OnSnapshot(Snapshot snap)
         {
-            if (priority.Length > 0)
+            latest = snap;
+            foreach (var p in snap.Procs)
             {
-                var pc = (ProcessPriorityClass)Enum.Parse(typeof(ProcessPriorityClass), priority);
-                if (p.PriorityClass != pc) p.PriorityClass = pc;
+                if (p.Description != null) knownDesc[p.Name] = p.Description;
+                if (p.Icon != null) knownIcon[p.Name] = p.Icon;
             }
-            if (mask != 0)
-            {
-                long m = mask & allMask;
-                if (m != 0 && (long)p.ProcessorAffinity != m) p.ProcessorAffinity = new IntPtr(m);
-            }
+            RefreshGrids();
         }
 
-        // Apply every remembered rule to every matching running process.
-        void EnforceRules()
+        void RefreshGrids()
         {
-            if (rules.Count == 0) return;
-            var map = new Dictionary<string, Rule>(StringComparer.OrdinalIgnoreCase);
-            foreach (var r in rules) map[r.Name] = r;
-            Process[] procs;
-            try { procs = Process.GetProcesses(); }
-            catch { return; }
-            foreach (var p in procs)
+            UpdateProcGrid();
+            UpdateRulesGrid();
+        }
+
+        Rule FindRule(string name)
+        {
+            return rules.FirstOrDefault(r => string.Equals(r.Name, name, StringComparison.OrdinalIgnoreCase));
+        }
+
+        static string CpuText(double v) { return v < 0.05 ? "0%" : v.ToString("0.0") + "%"; }
+        static string MemText(long b) { return (b / 1048576.0).ToString("#,0.0") + " MB"; }
+
+        string Display(string name)
+        {
+            string d;
+            return knownDesc.TryGetValue(name, out d) ? d : name + ".exe";
+        }
+
+        int PriIndex(string name) { return Array.IndexOf(Engine.PriorityNames, name ?? "") + 1; }
+
+        // ---------- processes page ----------
+
+        GridNode MakeProcNode(string key, string name, List<ProcInfo> list, bool remembered)
+        {
+            bool hasCpu = list.Any(p => p.Cpu >= 0);
+            double cpu = list.Where(p => p.Cpu > 0).Sum(p => p.Cpu);
+            long mem = list.Sum(p => p.Mem);
+            var pris = list.Select(p => p.Priority).Where(x => x != null).Distinct().ToList();
+            var affs = list.Where(p => p.Access).Select(p => p.Affinity).Distinct().ToList();
+            double totalPhys = latest != null && latest.TotalPhys > 0 ? latest.TotalPhys : 8.0 * 1024 * 1024 * 1024;
+            return new GridNode
+            {
+                Key = key,
+                Cells = new[]
+                {
+                    name,
+                    hasCpu ? CpuText(cpu) : "",
+                    mem > 0 ? MemText(mem) : "",
+                    pris.Count == 0 ? "" : pris.Count == 1 ? Engine.PriorityLabel(pris[0]) : "Mixed",
+                    affs.Count == 0 ? "" : affs.Count == 1 ? Engine.MaskText(affs[0]) : "Mixed",
+                    remembered ? "" : ""
+                },
+                Values = new double[]
+                {
+                    0, hasCpu ? cpu : -1, mem,
+                    pris.Count == 1 ? Engine.PriorityRank(pris[0]) : 0,
+                    affs.Count == 1 ? Engine.PopCount(affs[0]) : 0,
+                    remembered ? 1 : 0
+                },
+                Heat = new[]
+                {
+                    double.NaN,
+                    hasCpu ? Math.Min(1, cpu / 25.0) : double.NaN,
+                    mem > 0 ? Math.Min(1, mem / (totalPhys * 0.15)) : double.NaN,
+                    double.NaN, double.NaN, double.NaN
+                },
+                Dim = !list.Any(p => p.Access)
+            };
+        }
+
+        void UpdateProcGrid()
+        {
+            if (latest == null) return;
+            string q = search.Query;
+            bool showProtected = settingsPage.Protected.Checked;
+            var nodes = new List<GridNode>();
+            foreach (var grp in latest.Procs.GroupBy(p => p.Name, StringComparer.OrdinalIgnoreCase))
+            {
+                var list = grp.ToList();
+                string name = list[0].Name;
+                bool anyAccess = list.Any(p => p.Access);
+                if (!anyAccess && !showProtected) continue;
+                string desc = list.Select(p => p.Description).FirstOrDefault(d => d != null);
+                string exe = name + ".exe";
+                string display = desc ?? exe;
+                if (q.Length > 0 && exe.IndexOf(q, StringComparison.OrdinalIgnoreCase) < 0 &&
+                    (desc == null || desc.IndexOf(q, StringComparison.OrdinalIgnoreCase) < 0)) continue;
+                bool remembered = FindRule(name) != null;
+                var icon = list.Select(p => (Image)p.Icon).FirstOrDefault(i => i != null);
+                var node = MakeProcNode("g:" + name.ToLowerInvariant(),
+                    display + (list.Count > 1 ? " (" + list.Count + ")" : ""), list, remembered);
+                node.Icon = icon;
+                node.Tag = new ProcGroup { Name = name, Exe = exe, Display = display, Procs = list };
+                if (list.Count > 1)
+                {
+                    node.Children = new List<GridNode>();
+                    foreach (var p in list)
+                    {
+                        var c = MakeProcNode("p:" + p.Pid, display + "  ·  PID " + p.Pid, new List<ProcInfo> { p }, remembered);
+                        c.Icon = (Image)p.Icon ?? icon;
+                        c.Tag = new ProcGroup { Name = name, Exe = exe, Display = display, Procs = new List<ProcInfo> { p }, Single = true };
+                        node.Children.Add(c);
+                    }
+                }
+                nodes.Add(node);
+            }
+            gridProc.Columns[1].Summary = Math.Round(latest.CpuTotal) + "%";
+            gridProc.Columns[2].Summary = latest.MemLoad + "%";
+            gridProc.EmptyText = q.Length > 0 ? "No running programs match \"" + q + "\"." : "No programs to show.";
+            gridProc.SetData(nodes);
+        }
+
+        List<ProcGroup> SelectedGroups()
+        {
+            return gridProc.SelectedNodes().Select(n => (ProcGroup)n.Tag).ToList();
+        }
+
+        void OnProcSelection()
+        {
+            var groups = SelectedGroups();
+            if (groups.Count == 0)
+            {
+                pane.ShowEmpty("Select a program to change its priority and which CPU cores it can use.\n\nTip: right-click a program for quick actions.");
+                return;
+            }
+            var procs = groups.SelectMany(g => g.Procs).GroupBy(p => p.Pid).Select(g => g.First()).ToList();
+            var names = groups.Select(g => g.Name).Distinct(StringComparer.OrdinalIgnoreCase).ToList();
+            var g0 = groups[0];
+            string title, sub;
+            if (names.Count == 1)
+            {
+                title = g0.Display;
+                sub = g0.Exe + (procs.Count == 1 ? "  ·  PID " + procs[0].Pid : "  ·  " + procs.Count + " processes");
+            }
+            else
+            {
+                title = names.Count + " programs";
+                sub = string.Join(", ", names.Take(3).Select(n => n + ".exe").ToArray()) + (names.Count > 3 ? ", …" : "");
+            }
+            var access = procs.Where(p => p.Access).ToList();
+            var pris = access.Select(p => p.Priority).Distinct().ToList();
+            var affs = access.Select(p => p.Affinity).Distinct().ToList();
+            bool limit = affs.Count == 1 && affs[0] != allMask;
+            pane.ShowEditor(groups.Select(g => g.Procs.Select(p => (Image)p.Icon).FirstOrDefault(i => i != null)).FirstOrDefault(),
+                title, sub, RememberedInfo(names),
+                pris.Count == 1 ? PriIndex(pris[0]) : 0, limit, limit ? affs[0] : allMask,
+                "Remember", "", "Apply once", "", access.Count > 0);
+        }
+
+        string RememberedInfo(List<string> names)
+        {
+            var rs = names.Select(FindRule).Where(r => r != null).ToList();
+            if (rs.Count == 0) return "Not remembered. Changes are lost when the program restarts.";
+            if (names.Count == 1)
+            {
+                var r = rs[0];
+                var parts = new List<string>();
+                if (!string.IsNullOrEmpty(r.Priority)) parts.Add(Engine.PriorityLabel(r.Priority) + " priority");
+                if (r.Mask != 0) parts.Add(r.Mask == allMask ? "all cores" : "CPU " + Engine.MaskText(r.Mask));
+                return "Remembered: " + string.Join(", ", parts.ToArray()) + ". Applied every time it starts.";
+            }
+            return rs.Count + " of " + names.Count + " selected programs are remembered.";
+        }
+
+        bool ReadEditor(out string priority, out bool limit, out long mask)
+        {
+            int idx = pane.Priority.SelectedIndex;
+            priority = idx > 0 ? Engine.PriorityNames[idx - 1] : "";
+            limit = pane.Limit.Checked;
+            mask = pane.Cores.Mask & allMask;
+            if (limit && mask == 0)
+            {
+                pane.Status.Text = "Select at least one core, or turn off the core limit.";
+                return false;
+            }
+            return ConfirmRealtime(priority);
+        }
+
+        bool ConfirmRealtime(string priority)
+        {
+            if (priority != "RealTime") return true;
+            return MessageBox.Show(this,
+                "Realtime priority can make Windows unresponsive (mouse, keyboard, audio) if the program uses a lot of CPU.\n\n" +
+                "\"High\" is usually what you want. Use Realtime anyway?",
+                "Affinity Manager", MessageBoxButtons.YesNo, MessageBoxIcon.Warning, MessageBoxDefaultButton.Button2) == DialogResult.Yes;
+        }
+
+        int ApplyToPids(IEnumerable<int> pids, string priority, long mask, out string error)
+        {
+            int ok = 0;
+            error = null;
+            foreach (var pid in pids)
             {
                 try
                 {
-                    Rule r;
-                    if (map.TryGetValue(p.ProcessName, out r)) ApplyTo(p, r.Priority, r.Mask);
+                    using (var p = Process.GetProcessById(pid)) Engine.ApplyTo(p, priority, mask);
+                    ok++;
                 }
-                catch { }
-                finally { p.Dispose(); }
+                catch (Exception ex) { error = ex.Message; }
             }
+            return ok;
         }
 
-        // ---------- processes tab ----------
-
-        void RefreshProcesses()
+        IEnumerable<int> RunningPids(IEnumerable<string> names)
         {
-            if (!Visible && !allowVisible) return;
-            var selected = new HashSet<int>(lvProc.SelectedItems.Cast<ListViewItem>().Select(it => (int)it.Tag));
-            var remembered = new HashSet<string>(rules.Select(r => r.Name), StringComparer.OrdinalIgnoreCase);
-            string filter = txtFilter.Text.Trim();
-            int myPid = Process.GetCurrentProcess().Id;
-
-            suppressEvents = true;
-            lvProc.BeginUpdate();
-            lvProc.Items.Clear();
-            foreach (var p in Process.GetProcesses())
-            {
-                try
-                {
-                    if (p.Id == 0 || p.Id == 4 || p.Id == myPid) continue;
-                    string name = p.ProcessName;
-                    if (filter.Length > 0 && name.IndexOf(filter, StringComparison.OrdinalIgnoreCase) < 0) continue;
-                    string pri = null, aff = null;
-                    try { pri = PriorityLabel(p.PriorityClass.ToString()); } catch { }
-                    try { aff = MaskToString((long)p.ProcessorAffinity); } catch { }
-                    bool denied = pri == null || aff == null;
-                    if (denied && chkHideDenied.Checked) continue;
-
-                    var it = new ListViewItem(name + ".exe");
-                    it.SubItems.Add(p.Id.ToString());
-                    it.SubItems.Add(pri ?? "(no access)");
-                    it.SubItems.Add(aff ?? "(no access)");
-                    it.SubItems.Add(remembered.Contains(name) ? "Yes" : "");
-                    it.Tag = p.Id;
-                    if (denied) it.ForeColor = SystemColors.GrayText;
-                    lvProc.Items.Add(it);
-                    if (selected.Contains(p.Id)) it.Selected = true;
-                }
-                catch { }
-                finally { p.Dispose(); }
-            }
-            lvProc.EndUpdate();
-            if (lvProc.SelectedItems.Count > 0) lvProc.SelectedItems[0].EnsureVisible();
-            else if (lvProc.Items.Count > 0) lvProc.Items[0].EnsureVisible();
-            suppressEvents = false;
-        }
-
-        void OnProcessSelected()
-        {
-            if (suppressEvents || lvProc.SelectedItems.Count == 0) return;
-            int pid = (int)lvProc.SelectedItems[0].Tag;
-            try
-            {
-                using (var p = Process.GetProcessById(pid))
-                    LoadEditor(p.PriorityClass.ToString(), (long)p.ProcessorAffinity);
-                SetStatus(lvProc.SelectedItems.Count == 1 ? "" : lvProc.SelectedItems.Count + " processes selected.");
-            }
-            catch (Exception ex) { SetStatus("Can't read this process: " + ex.Message); }
-        }
-
-        List<int> SelectedPids()
-        {
-            return lvProc.SelectedItems.Cast<ListViewItem>().Select(it => (int)it.Tag).ToList();
+            var set = new HashSet<string>(names, StringComparer.OrdinalIgnoreCase);
+            return latest == null ? Enumerable.Empty<int>() : latest.Procs.Where(p => set.Contains(p.Name)).Select(p => p.Pid).ToList();
         }
 
         void ApplyOnce()
         {
-            var pids = SelectedPids();
-            if (pids.Count == 0) { SetStatus("Select one or more programs in the list first."); return; }
-            string pri; long mask;
-            if (!ReadEditor(out pri, out mask)) return;
-            int ok = 0, fail = 0; string err = "";
-            foreach (var pid in pids)
-            {
-                try { using (var p = Process.GetProcessById(pid)) ApplyTo(p, pri, mask); ok++; }
-                catch (Exception ex) { fail++; err = ex.Message; }
-            }
-            SetStatus("Applied to " + ok + " process(es)." + (fail > 0 ? " Failed for " + fail + ": " + err : ""));
-            RefreshProcesses();
+            var groups = SelectedGroups();
+            if (groups.Count == 0) return;
+            string pri; bool limit; long mask;
+            if (!ReadEditor(out pri, out limit, out mask)) return;
+            var pids = groups.SelectMany(g => g.Procs).Select(p => p.Pid).Distinct().ToList();
+            string err;
+            int ok = ApplyToPids(pids, pri, limit ? mask : allMask, out err);
+            pane.Status.Text = "Applied to " + ok + " of " + pids.Count + " process(es)." + (err != null ? " " + err : "");
+            Tick();
         }
 
-        void SaveFromEditor()
+        void RememberFromEditor()
         {
-            string pri; long mask;
-            bool procTab = OnProcTab;
-            if (procTab && lvProc.SelectedItems.Count == 0) { SetStatus("Select one or more programs in the list first."); return; }
-            if (!procTab && lvRules.SelectedItems.Count == 0) { SetStatus("Select one or more remembered programs first."); return; }
-            if (!ReadEditor(out pri, out mask)) return;
-            if (pri.Length == 0 && mask == 0)
+            var groups = SelectedGroups();
+            if (groups.Count == 0) return;
+            string pri; bool limit; long mask;
+            if (!ReadEditor(out pri, out limit, out mask)) return;
+            if (pri.Length == 0 && !limit)
             {
-                SetStatus("Nothing to remember: choose a priority and/or tick \"Change affinity\".");
+                pane.Status.Text = "Choose a priority or limit the cores first. There's nothing to remember yet.";
                 return;
             }
-
-            IEnumerable<string> names;
-            if (procTab)
-                names = lvProc.SelectedItems.Cast<ListViewItem>()
-                    .Select(it => StripExe(it.Text)).Distinct(StringComparer.OrdinalIgnoreCase).ToList();
-            else
-                names = lvRules.SelectedItems.Cast<ListViewItem>().Select(it => ((Rule)it.Tag).Name).ToList();
-
-            int count = 0;
-            foreach (var n in names) { Upsert(n, pri, mask); count++; }
+            var names = groups.Select(g => g.Name).Distinct(StringComparer.OrdinalIgnoreCase).ToList();
+            foreach (var n in names) Upsert(n, pri, limit ? mask : 0);
             if (!SaveRules()) return;
-            EnforceRules();
-            SetStatus("Remembered " + count + " program(s). Applied now and every time they start.");
-            RefreshRules();
-            RefreshProcesses();
+            string err;
+            ApplyToPids(RunningPids(names), pri, limit ? mask : allMask, out err);
+            pane.Info.Text = RememberedInfo(names);
+            pane.Status.Text = "Saved. Applied now and every time " + (names.Count == 1 ? names[0] + ".exe starts." : "these programs start.");
+            RefreshGrids();
+            Tick();
         }
 
-        static string StripExe(string s)
+        void RememberCurrent(List<ProcGroup> groups)
         {
-            return s.EndsWith(".exe", StringComparison.OrdinalIgnoreCase) ? s.Substring(0, s.Length - 4) : s;
+            int count = 0;
+            foreach (var g in groups.GroupBy(x => x.Name, StringComparer.OrdinalIgnoreCase))
+            {
+                var access = g.SelectMany(x => x.Procs).Where(p => p.Access).ToList();
+                var pris = access.Select(p => p.Priority).Distinct().ToList();
+                var affs = access.Select(p => p.Affinity).Distinct().ToList();
+                string pri = pris.Count == 1 ? pris[0] : "";
+                long mask = affs.Count == 1 && affs[0] != allMask ? affs[0] : 0;
+                if (pri.Length == 0 && mask == 0) continue;
+                Upsert(g.Key, pri, mask);
+                count++;
+            }
+            if (count > 0 && SaveRules()) pane.Status.Text = "Remembered the current settings of " + count + " program(s).";
+            RefreshGrids();
+            OnProcSelection();
+        }
+
+        void SetPriorityOnce(List<ProcGroup> groups, string priority)
+        {
+            if (!ConfirmRealtime(priority)) return;
+            var pids = groups.SelectMany(g => g.Procs).Select(p => p.Pid).Distinct().ToList();
+            string err;
+            int ok = ApplyToPids(pids, priority, 0, out err);
+            pane.Status.Text = "Set " + Engine.PriorityLabel(priority) + " priority on " + ok + " of " + pids.Count + " process(es)." + (err != null ? " " + err : "");
+            Tick();
+        }
+
+        void ShowMenu(ContextMenuStrip m, Control c, Point p)
+        {
+            if (lastMenu != null) lastMenu.Dispose();
+            lastMenu = m;
+            m.Show(c, p);
+        }
+
+        void ProcContextMenu(object sender, MouseEventArgs e)
+        {
+            var groups = SelectedGroups();
+            if (groups.Count == 0) return;
+            var m = Fluent.Menu();
+            var pri = Fluent.Item("Set priority", null);
+            Fluent.StyleDropDown(pri.DropDown);
+            var current = groups.SelectMany(g => g.Procs).Select(p => p.Priority).Distinct().ToList();
+            for (int i = 0; i < Engine.PriorityNames.Length; i++)
+            {
+                string name = Engine.PriorityNames[i];
+                var it = Fluent.Item(Engine.PriorityLabels[i], delegate { SetPriorityOnce(groups, name); });
+                it.Checked = current.Count == 1 && current[0] == name;
+                pri.DropDownItems.Add(it);
+            }
+            m.Items.Add(pri);
+            m.Items.Add(Fluent.Item("Remember current settings", delegate { RememberCurrent(groups); }));
+            var names = groups.Select(g => g.Name).Distinct(StringComparer.OrdinalIgnoreCase).ToList();
+            var forget = Fluent.Item("Forget remembered settings", delegate { Forget(names); });
+            forget.Enabled = names.Any(n => FindRule(n) != null);
+            m.Items.Add(forget);
+            m.Items.Add(new ToolStripSeparator());
+            string path = groups.Count == 1 ? groups[0].Procs.Select(p => p.Path).FirstOrDefault(x => x != null) : null;
+            var open = Fluent.Item("Open file location", delegate
+            {
+                try { Process.Start("explorer.exe", "/select,\"" + path + "\""); } catch { }
+            });
+            open.Enabled = path != null;
+            m.Items.Add(open);
+            ShowMenu(m, gridProc, e.Location);
+        }
+
+        // ---------- remembered page ----------
+
+        void UpdateRulesGrid()
+        {
+            string q = search.Query;
+            var nodes = new List<GridNode>();
+            foreach (var r in rules)
+            {
+                string exe = r.Name + ".exe";
+                string desc;
+                knownDesc.TryGetValue(r.Name, out desc);
+                if (q.Length > 0 && exe.IndexOf(q, StringComparison.OrdinalIgnoreCase) < 0 &&
+                    (desc == null || desc.IndexOf(q, StringComparison.OrdinalIgnoreCase) < 0)) continue;
+                int running = latest == null ? 0 : latest.Procs.Count(p => string.Equals(p.Name, r.Name, StringComparison.OrdinalIgnoreCase));
+                Image icon;
+                knownIcon.TryGetValue(r.Name, out icon);
+                nodes.Add(new GridNode
+                {
+                    Key = "r:" + r.Name.ToLowerInvariant(),
+                    Cells = new[]
+                    {
+                        desc != null ? desc + "  (" + exe + ")" : exe,
+                        string.IsNullOrEmpty(r.Priority) ? "Don't change" : Engine.PriorityLabel(r.Priority),
+                        r.Mask == 0 ? "Don't change" : Engine.MaskText(r.Mask),
+                        running > 0 ? running.ToString() : "No"
+                    },
+                    Values = new double[] { 0, PriIndex(r.Priority), r.Mask == 0 ? 0 : Engine.PopCount(r.Mask), running },
+                    Icon = icon,
+                    Tag = r
+                });
+            }
+            gridRules.EmptyText = rules.Count == 0
+                ? "Nothing remembered yet.\nPick a program on the Processes page and click Remember, or use Add program."
+                : "No remembered programs match \"" + q + "\".";
+            gridRules.SetData(nodes);
+        }
+
+        List<Rule> SelectedRules() { return gridRules.SelectedNodes().Select(n => (Rule)n.Tag).ToList(); }
+        List<string> SelectedRuleNames() { return SelectedRules().Select(r => r.Name).ToList(); }
+
+        void OnRuleSelection()
+        {
+            var rs = SelectedRules();
+            if (rs.Count == 0)
+            {
+                pane.ShowEmpty(rules.Count == 0
+                    ? "Programs you remember show up here. Their settings are applied automatically every time they start."
+                    : "Select a remembered program to edit or forget it.");
+                return;
+            }
+            var r0 = rs[0];
+            int running = RunningPids(rs.Select(r => r.Name)).Count();
+            Image icon;
+            knownIcon.TryGetValue(r0.Name, out icon);
+            string title = rs.Count == 1 ? Display(r0.Name) : rs.Count + " programs";
+            string sub = rs.Count == 1 ? r0.Name + ".exe" : string.Join(", ", rs.Take(3).Select(r => r.Name + ".exe").ToArray()) + (rs.Count > 3 ? ", …" : "");
+            string info = (running > 0 ? "Running now (" + running + " process" + (running == 1 ? "" : "es") + "). " : "Not running right now. ") +
+                          "Settings are applied automatically whenever it starts.";
+            pane.ShowEditor(icon, title, sub, info, PriIndex(r0.Priority), r0.Mask != 0, r0.Mask != 0 ? r0.Mask : allMask,
+                "Save changes", "", "Forget", "", true);
+        }
+
+        void SaveRuleEdits()
+        {
+            var rs = SelectedRules();
+            if (rs.Count == 0) return;
+            string pri; bool limit; long mask;
+            if (!ReadEditor(out pri, out limit, out mask)) return;
+            if (pri.Length == 0 && !limit)
+            {
+                pane.Status.Text = "Choose a priority or limit the cores. Otherwise use Forget.";
+                return;
+            }
+            foreach (var r in rs) { r.Priority = pri; r.Mask = limit ? mask : 0; }
+            if (!SaveRules()) return;
+            string err;
+            ApplyToPids(RunningPids(rs.Select(r => r.Name)), pri, limit ? mask : allMask, out err);
+            pane.Status.Text = "Saved.";
+            RefreshGrids();
+            Tick();
+        }
+
+        void Forget(List<string> names)
+        {
+            if (names.Count == 0) return;
+            var set = new HashSet<string>(names, StringComparer.OrdinalIgnoreCase);
+            int removed = rules.RemoveAll(r => set.Contains(r.Name));
+            if (removed == 0 || !SaveRules()) return;
+            RefreshGrids();
+            if (page == 0) OnProcSelection(); else OnRuleSelection();
+            pane.Status.Text = "Forgot " + removed + " program(s). Running copies keep their current settings until restarted.";
+        }
+
+        void RulesContextMenu(object sender, MouseEventArgs e)
+        {
+            var names = SelectedRuleNames();
+            if (names.Count == 0) return;
+            var m = Fluent.Menu();
+            m.ShowCheckMargin = false;
+            m.Items.Add(Fluent.Item("Forget", delegate { Forget(names); }));
+            ShowMenu(m, gridRules, e.Location);
+        }
+
+        void AddRuleFromFile()
+        {
+            using (var dlg = new OpenFileDialog { Filter = "Programs (*.exe)|*.exe", Title = "Choose a program to remember" })
+            {
+                if (dlg.ShowDialog(this) != DialogResult.OK) return;
+                string name = Path.GetFileNameWithoutExtension(dlg.FileName);
+                if (!knownDesc.ContainsKey(name))
+                {
+                    try
+                    {
+                        var d = FileVersionInfo.GetVersionInfo(dlg.FileName).FileDescription;
+                        if (!string.IsNullOrEmpty(d) && d.Trim().Length > 0) knownDesc[name] = d.Trim();
+                    }
+                    catch { }
+                }
+                if (!knownIcon.ContainsKey(name))
+                {
+                    try
+                    {
+                        using (var ic = Icon.ExtractAssociatedIcon(dlg.FileName))
+                            if (ic != null) knownIcon[name] = new Bitmap(ic.ToBitmap(), P(32), P(32));
+                    }
+                    catch { }
+                }
+                if (FindRule(name) == null) Upsert(name, "Normal", 0);
+                if (!SaveRules()) return;
+                search.Box.Text = "";
+                UpdateRulesGrid();
+                gridRules.Selected.Clear();
+                gridRules.Selected.Add("r:" + name.ToLowerInvariant());
+                gridRules.Invalidate();
+                OnRuleSelection();
+                pane.Status.Text = "Added " + name + ".exe. Pick its priority and cores, then click Save changes.";
+            }
         }
 
         void Upsert(string name, string pri, long mask)
         {
-            var r = rules.FirstOrDefault(x => string.Equals(x.Name, name, StringComparison.OrdinalIgnoreCase));
+            var r = FindRule(name);
             if (r == null) { r = new Rule { Name = name }; rules.Add(r); }
             r.Priority = pri;
             r.Mask = mask;
@@ -753,67 +1010,6 @@ namespace AffinityManager
                 return false;
             }
         }
-
-        // ---------- rules tab ----------
-
-        void RefreshRules()
-        {
-            var selected = new HashSet<string>(lvRules.SelectedItems.Cast<ListViewItem>().Select(it => ((Rule)it.Tag).Name),
-                StringComparer.OrdinalIgnoreCase);
-            suppressEvents = true;
-            lvRules.BeginUpdate();
-            lvRules.Items.Clear();
-            foreach (var r in rules)
-            {
-                var it = new ListViewItem(r.Name + ".exe");
-                it.SubItems.Add(PriorityLabel(r.Priority));
-                it.SubItems.Add(MaskToString(r.Mask));
-                it.Tag = r;
-                lvRules.Items.Add(it);
-                if (selected.Contains(r.Name)) it.Selected = true;
-            }
-            lvRules.EndUpdate();
-            suppressEvents = false;
-            tabRules.Text = "Remembered programs (" + rules.Count + ")";
-        }
-
-        void OnRuleSelected()
-        {
-            if (suppressEvents || lvRules.SelectedItems.Count == 0) return;
-            var r = (Rule)lvRules.SelectedItems[0].Tag;
-            LoadEditor(r.Priority, r.Mask);
-            SetStatus("Edit the settings, then click \"Save changes to selected\".");
-        }
-
-        void AddRuleFromFile()
-        {
-            using (var dlg = new OpenFileDialog { Filter = "Programs (*.exe)|*.exe", Title = "Choose a program to remember" })
-            {
-                if (dlg.ShowDialog(this) != DialogResult.OK) return;
-                string name = Path.GetFileNameWithoutExtension(dlg.FileName);
-                string pri; long mask;
-                if (!ReadEditor(out pri, out mask)) return;
-                if (pri.Length == 0 && mask == 0) { pri = "Normal"; }
-                Upsert(name, pri, mask);
-                if (!SaveRules()) return;
-                EnforceRules();
-                RefreshRules();
-                foreach (ListViewItem it in lvRules.Items)
-                    it.Selected = string.Equals(((Rule)it.Tag).Name, name, StringComparison.OrdinalIgnoreCase);
-                SetStatus("Added " + name + ".exe with the current settings on the right. Adjust and click \"Save changes to selected\" if needed.");
-            }
-        }
-
-        void RemoveSelectedRules()
-        {
-            var sel = lvRules.SelectedItems.Cast<ListViewItem>().Select(it => (Rule)it.Tag).ToList();
-            if (sel.Count == 0) return;
-            foreach (var r in sel) rules.Remove(r);
-            if (!SaveRules()) return;
-            RefreshRules();
-            RefreshProcesses();
-            SetStatus("Forgot " + sel.Count + " program(s). Running copies keep their current settings until restarted.");
-        }
     }
 
     static class Program
@@ -822,7 +1018,12 @@ namespace AffinityManager
         static void Main(string[] args)
         {
             bool created;
-            var showSignal = new EventWaitHandle(false, EventResetMode.AutoReset, "Local\\AffinityManager_Show", out created);
+#if TESTBUILD
+            const string signalName = "Local\\AffinityManager_Show_Test";
+#else
+            const string signalName = "Local\\AffinityManager_Show";
+#endif
+            var showSignal = new EventWaitHandle(false, EventResetMode.AutoReset, signalName, out created);
             if (!created)
             {
                 // Already running: ask the existing instance to show its window.
@@ -831,6 +1032,9 @@ namespace AffinityManager
             }
             Application.EnableVisualStyles();
             Application.SetCompatibleTextRenderingDefault(false);
+            float scale = 1f;
+            using (var g = Graphics.FromHwnd(IntPtr.Zero)) scale = g.DpiX / 96f;
+            Theme.Init(scale);
             bool tray = args.Any(a => a.Equals("--tray", StringComparison.OrdinalIgnoreCase));
             Application.Run(new MainForm(tray, showSignal));
             GC.KeepAlive(showSignal);
